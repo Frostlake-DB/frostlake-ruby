@@ -1,0 +1,4 @@
+Gemfile.lock
+*.gem
+db-engine.log
+.idea
