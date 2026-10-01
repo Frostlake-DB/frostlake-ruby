@@ -32,7 +32,7 @@ rescue LoadError
 end
 
 module Frostlake
-  VERSION = "0.1.0"
+  VERSION = "0.2.0"
 
   # Every failure the driver raises is a Frostlake::Error, so one rescue still
   # catches the lot; the subclasses only say which kind it was.
