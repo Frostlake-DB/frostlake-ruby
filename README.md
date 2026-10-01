@@ -24,7 +24,7 @@ passed through intact.
 
 ## Engine version
 
-Requires a Frostlake engine **0.0.7 or newer**. Ask a running server which one it is with
+Requires a Frostlake engine **0.2.0 or newer**. Ask a running server which one it is with
 `SELECT CURRENT_VERSION()` — every release answers it, so the check works against any engine.
 
 The driver versions independently of the engine: it speaks the HTTP protocol, not
@@ -32,7 +32,8 @@ the jar, so this is a floor rather than a lockstep pin.
 
 One behaviour does depend on the engine: a `TIMESTAMP_TZ` column only reports back the
 UTC offset it was given from engine **0.1.0** on. Against an older engine a bound `Time`
-still round-trips, but the offset comes back as `+00:00`.
+still round-trips, but the offset comes back as `+00:00`. Recovering from a lost session
+and releasing the session on close need **0.1.0** too; see [Session lifetime](#session-lifetime).
 
 ## Usage
 
@@ -81,6 +82,13 @@ conn.execute("...")
 conn.commit                  # / conn.rollback
 ```
 
+`begin_transaction` sends `BEGIN` with autocommit off, and the connection leaves
+autocommit only once the engine has opened the transaction. A begin that fails — refused,
+unanswered or unreadable, lost with its session, or never sent because a `USE` queued
+ahead of it was refused — leaves the connection in autocommit, so the statements after it
+commit as they run. `transaction` follows a begin that fails with a best-effort rollback
+as well, in case a `BEGIN` whose answer was lost did open a transaction.
+
 ### Bind values
 
 Parameters are inlined client-side (`?` placeholders); placeholders inside string
@@ -99,6 +107,12 @@ Frostlake's other drivers.
 | `Date` | `'…'::DATE` |
 | `Array` | `[…]` (elements formatted recursively) |
 
+A bound `Time` goes into a `TIMESTAMP_TZ` column as it is. A `TIMESTAMP_NTZ` or
+`TIMESTAMP_LTZ` column refuses it while compiling, as the account refuses any
+`TIMESTAMP_TZ` written into one (`expecting TIMESTAMP_NTZ(9) but got TIMESTAMP_TZ(9)`),
+so cast the bind there: `CAST(? AS TIMESTAMP_NTZ)` keeps the wall clock the `Time` was
+written with, and `CAST(? AS TIMESTAMP_LTZ)` keeps its instant.
+
 ### Result types
 
 Fixed-point `NUMBER` keeps the exact digits the engine sent: `BigDecimal` when the
@@ -108,8 +122,23 @@ arbitrary precision). `FLOAT`/`DOUBLE`/`REAL` are genuine binary floats and stay
 `BINARY` a binary-encoded `String`; `TIME` and semi-structured values keep their
 wire shape as strings.
 
-Each entry in `columns` is a hash of `{ name:, data_type:, scale: }`, carrying the
-engine's own type name.
+A `TIMESTAMP_NTZ` is a wall clock with no zone of its own, so it comes back as a `Time`
+flagged UTC (`utc?` is true) whose fields read back exactly as stored, whatever zone the
+host is in; a column declared `DATETIME`, or `TIMESTAMP` under the default mapping, is
+one. Read in the host's local zone instead, a wall clock that zone skips would move:
+`2024-03-31 01:30` does not exist in London, whose clocks go from 01:00 straight to 02:00
+that night, so it would come back as `02:30 +0100`. The instant such a `Time` names is its
+wall clock read as UTC, the one the engine's own epoch arithmetic
+(`DATE_PART(EPOCH_SECOND, …)`) gives the value, and written back through
+`CAST(? AS TIMESTAMP_NTZ)` it stores the wall clock it was read with. `TIMESTAMP_LTZ` and
+`TIMESTAMP_TZ` carry an offset on the wire and come back as a `Time` at that instant and
+offset.
+
+Each entry in `columns` is a hash of `{ name:, data_type:, scale:, length: }`, carrying
+the engine's own type name. `length` is the width a text or binary column was declared
+with — characters for `VARCHAR(9)`, bytes for `BINARY(5)`, and the maximum (16777216 /
+8388608) for one declared without a width. Every other type reports `nil`: the server
+sends no width for it, and `nil` is that, not a width of `0`.
 
 A result set arrives as one JSON body and is fully materialised — the driver holds
 every row in memory, and the protocol offers no cursor to page through a large
@@ -121,13 +150,32 @@ a bundler setup on Ruby ≥ 3.4 without it in the Gemfile — those cells fall b
 
 ### Several statements at once
 
+A request carries one statement unless the session asks for more, as on the account, so a pack
+sent without asking is refused with `Actual statement count 2 did not match the desired
+statement count 1.` Ask with `ALTER SESSION SET MULTI_STATEMENT_COUNT = n`, or `0` for any
+number.
+
 `execute` returns the first result set. `execute_all` returns every one, in order:
 
 ```ruby
+conn.execute("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0")
 sets = conn.execute_all("SELECT 1 AS a; SELECT 2 AS b;")
 sets.length      # => 2
 sets.last.rows   # => [{ "B" => 2 }]
 ```
+
+A call can declare its own count instead of asking the session, with the
+`multi_statement_count:` keyword on `execute` and `execute_all`:
+
+```ruby
+sets = conn.execute_all("SELECT 1 AS a; SELECT 2 AS b;", [], multi_statement_count: 2)
+```
+
+The count says how many statements that one call carries, `0` for any number. It
+travels with that request and outranks the session's `MULTI_STATEMENT_COUNT` for it,
+but changes no session state — nothing to save and put back, and a connection shared
+between threads is unaffected. Left out, nothing is sent and the session's value
+decides, which is 1 until it is told otherwise.
 
 If any statement in the string fails the whole call raises and no result sets come
 back — not even for the statements before it. The engine discards their effects
@@ -164,28 +212,60 @@ same goes for `verify_ssl` and `ca_file` on a DSN that is not `https` — they a
 refused however they were spelled, since they would do nothing. The path names one
 database, so `frostlake://host/db/extra` is refused too.
 
-### Idle sessions
+### Session lifetime
 
-The engine drops a session after 30 minutes idle and then quietly builds a fresh one
-for the id the driver keeps sending. A connection left sitting therefore loses the
-database and schema it had selected, and **nothing in the reply says so** — the id
-you sent is echoed back either way, and `/api/sessions` reports only a count, so the
-driver cannot ask whether its session survived.
+A connection is one session on the engine, and the session is where the current
+database and schema, session variables, `ALTER SESSION` settings, temporary tables and
+an open transaction live. The engine ends a session after 30 minutes idle, when it is
+released, or when the server restarts. From engine 0.1.0 on every answer says whether
+the session it ran in is new (`newSession`), and the driver takes the first answer that
+names a session as the sign of which kind of engine it is talking to.
 
-What it does instead: once a connection has been idle longer than
-`session_idle_limit` (1800 seconds by default, matching the engine), it re-applies
-the database and schema from the DSN before the next statement. It stops doing that
-the moment you run a `USE` of your own, since the DSN no longer describes where you
-are.
+**What is sent.** Every request after the first names the session. To an engine that
+reports `newSession` it also sends `requireSession: true`, so a session the engine no
+longer holds is refused (HTTP 404) instead of being quietly replaced by a fresh one in
+which the statement would run somewhere else. An older engine is sent neither that
+field nor the release below.
+
+**After a lost session.** The refused statement did not run. If the lost session held
+nothing a fresh one lacks, the driver starts a fresh session, puts the DSN's database and
+schema back on it, and sends the statement once more; if that is refused too, it raises.
+If the lost session held an open transaction, or context set up with `USE`,
+`SET`/`UNSET`, `ALTER SESSION`, a temporary object or a `CREATE`/`DROP` of a database or
+schema, running the statement again could put it somewhere its author did not intend, so
+the driver raises `Frostlake::SessionLostError` instead, saying which. Either way the
+connection stays usable: its next statement starts a fresh session on the DSN's database
+and schema.
+
+```ruby
+begin
+  conn.execute("INSERT INTO acc VALUES (2)")
+rescue Frostlake::SessionLostError
+  # The transaction and anything set up on the session are gone; start the unit of
+  # work over. The connection itself is fine.
+end
+```
+
+**Close.** `close` sends `DELETE /api/sessions/{id}`, which ends the session and rolls
+back a transaction it left open. It is best effort and bounded (five seconds to connect
+and five to be answered, or the connection's own timeouts when they are shorter), and it
+never raises. Closing again sends nothing. An engine older than 0.1.0 has no such
+endpoint, so it is not asked, and the session lingers until its idle expiry.
+
+**Older engines.** Before 0.1.0 the engine quietly builds a fresh session for the id the
+driver keeps sending, and nothing in the reply says so. Against such an engine a
+connection that has been idle longer than `session_idle_limit` (1800 seconds by default,
+matching the engine) re-applies the database and schema from the DSN before the next
+statement. It stops doing that the moment you run a `USE` of your own, since the DSN no
+longer describes where you are. Everything else a dropped session held — the warehouse,
+the role, session variables, an open transaction — is gone, and no client can restore
+it. An engine that reports `newSession` has no need of the timer, and the driver leaves
+it off there.
 
 ```ruby
 Frostlake.connect(dsn, session_idle_limit: 600)   # re-apply after ten idle minutes
 Frostlake.connect("frostlake://host:18082/DB?session_idle_limit=0")  # never
 ```
-
-Everything else a dropped session held — the warehouse, the role, session variables,
-an open transaction — is gone, and no client can restore it. If a connection may idle
-for long stretches, reconnecting is the dependable answer.
 
 ### Errors
 
@@ -195,6 +275,7 @@ the lot. The subclass says which kind it was:
 | Class | Raised when |
 | --- | --- |
 | `Frostlake::ConnectionError` | the server is unreachable, unhealthy, or the request failed |
+| `Frostlake::SessionLostError` | a `ConnectionError`: the engine no longer holds the session, and the transaction or context it held cannot be put back; the statement did not run |
 | `Frostlake::QueryError` | the engine rejected the statement; the message is the engine's |
 | `Frostlake::UsageError` | the driver was misused: bad DSN, closed connection, unbindable value |
 
@@ -218,11 +299,48 @@ rake test        # or: ruby test/test_frostlake.rb
 Without `FROSTLAKE_CLASSPATH` the integration tests skip themselves and only the
 substitution unit tests run.
 
+## Testkit corpus runner
+
+`testkit_runner.rb` replays the engine's testkit corpus — the language-neutral JSON
+suites in `frostlake/engine/src/test/resources/testkit/suites`, format in the `SCHEMA.md`
+beside them — through this driver, and compares every cell as the driver hands it back.
+`FL_CORPUS` names that testkit directory, best as an absolute path. With it set, the test
+suite replays the corpus as one more test, which fails when any case does; without it, or
+with neither `FROSTLAKE_URL` nor `FROSTLAKE_CLASSPATH` to replay against, that test is
+skipped:
+
+```sh
+FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit ruby test/test_frostlake.rb
+```
+
+The runner also runs on its own:
+
+```sh
+FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit \
+  FROSTLAKE_URL=frostlake://127.0.0.1:18082 ruby testkit_runner.rb
+```
+
+Every case recreates `test_db`, so point it at a scratch server — or leave
+`FROSTLAKE_URL` out and it boots one of its own from `FROSTLAKE_CLASSPATH`, in the test
+suite too. `FROSTLAKE_TESTKIT_FILTER=word1,word2` replays only the suites whose name
+contains one of the words.
+
+Each case runs on a connection of its own, after the reset the corpus prescribes; a case
+skipped for `ruby` or `http` reports SKIP. The report, `results/testkit-ruby.tsv` unless
+`FROSTLAKE_TESTKIT_REPORT` says otherwise, holds one row per case (`suite`, `test`,
+`status`, `failedStep`, `detail`, `ms`). Beside it `missing-apis-ruby.md` lists the checks
+the protocol cannot express — an expected error's code or SQLSTATE — which are recorded
+rather than failed. The run ends with `testkit [ruby]: <P> passed, <F> failed, <S> skipped`
+and exits 1 when any case failed, or when `FL_CORPUS` holds no suites.
+
 ## Protocol
 
-One `POST /api/execute` per statement with `{ sql, sessionId, autoCommit }`; the server
+One `POST /api/execute` per statement with `{ sql, sessionId, autoCommit }` — plus
+`multiStatementCount` when a call declares one, and nothing at all when it does not; the server
 issues the `sessionId` on first contact and the driver echoes it back, so session state
-(current database/schema, transactions) persists across statements. `GET /api/health`
+(current database/schema, transactions) persists across statements. To an engine that
+reports `newSession` the driver adds `requireSession: true`, and `close` sends
+`DELETE /api/sessions/{id}` (see [Session lifetime](#session-lifetime)). `GET /api/health`
 backs `Frostlake.connect`'s reachability check.
 
 ## License

@@ -41,6 +41,15 @@ module Frostlake
   # The server could not be reached, or the connection failed mid-statement.
   class ConnectionError < Error; end
 
+  # The engine no longer holds the connection's session: it expired, was
+  # released, or the server restarted. Raised instead of re-running the
+  # statement when the lost session held what a fresh one cannot reproduce —
+  # an open transaction, or context set up with USE, SET, ALTER SESSION or a
+  # temporary object. The statement did not run, and the connection stays
+  # usable: its next statement starts a fresh session on the DSN's database
+  # and schema.
+  class SessionLostError < ConnectionError; end
+
   # The engine rejected a statement. The message is the engine's own.
   class QueryError < Error; end
 
@@ -60,13 +69,33 @@ module Frostlake
   DEFAULT_OPEN_TIMEOUT = 10
   DEFAULT_READ_TIMEOUT = 300
 
-  # The engine reaps a session after 30 minutes idle. Past that we have to
-  # assume ours is gone, because nothing in a response says so.
+  # The engine reaps a session after 30 minutes idle. An engine that predates
+  # newSession says nothing when it does, so past that we have to assume ours
+  # is gone.
   DEFAULT_SESSION_IDLE_LIMIT = 1800
+
+  # How long closing may spend releasing the session, in seconds, to connect
+  # and again to be answered; a connection timeout that is shorter wins.
+  CLOSE_BUDGET = 5
 
   # The engine's binary floating-point types. Every other numeric it reports is
   # fixed-point and keeps its digits.
   APPROXIMATE_TYPES = ["FLOAT", "FLOAT4", "FLOAT8", "DOUBLE", "DOUBLE PRECISION", "REAL"].freeze
+
+  # A character of an unquoted identifier or keyword. $ is one, which is why
+  # A$$B is a name.
+  WORD_CHAR = /[[:alnum:]_$]/.freeze
+
+  # The words that may sit between CREATE, DROP or ALTER and the kind of
+  # object the statement names.
+  OBJECT_MODIFIERS = ["OR", "REPLACE", "TRANSIENT", "TEMPORARY", "TEMP", "VOLATILE", "LOCAL", "GLOBAL",
+                      "SECURE", "IF", "NOT", "EXISTS", "PUBLIC", "PRIVATE", "ICEBERG", "DYNAMIC",
+                      "HYBRID", "EVENT", "RECURSIVE", "MATERIALIZED", "EXTERNAL"].freeze
+
+  # The modifiers that make an object temporary: it lives only as long as the
+  # session that created it.
+  TEMPORARY = ["TEMPORARY", "TEMP", "VOLATILE"].freeze
+  private_constant :WORD_CHAR, :OBJECT_MODIFIERS, :TEMPORARY
 
   # Connects, verifies the server is reachable via GET /api/health, and applies
   # the database and schema from the DSN. Timeouts are in seconds; verify_ssl
@@ -130,6 +159,11 @@ module Frostlake
   end
 
   class Connection
+    # What round_trip answers when the engine refused the session id as one it
+    # no longer holds. Nothing ran.
+    SESSION_GONE = :session_gone
+    private_constant :SESSION_GONE
+
     def initialize(dsn, open_timeout: nil, read_timeout: nil, verify_ssl: nil, ca_file: nil,
                    session_idle_limit: nil)
       uri = begin
@@ -188,6 +222,15 @@ module Frostlake
       # DSN's defaults are no longer the whole truth about this session.
       @session_touched = false
       @session_id = nil
+      # Whether the engine reports newSession, which arrived together with
+      # requireSession and DELETE /api/sessions: nil until the first answer
+      # that names a session, which settles it either way.
+      @tracks_sessions = nil
+      # What the session holds that a fresh one would not: context a statement
+      # set up (USE, SET, ALTER SESSION, a temporary object, CREATE or DROP of a
+      # database or schema), and an open transaction.
+      @dirty = false
+      @in_transaction = false
       @autocommit = true
       @closed = false
       @pending_use = []
@@ -198,8 +241,8 @@ module Frostlake
         raise UsageError, "the DSN path names one database, got #{uri.path.inspect}"
       end
       schema = query["schema"]
-      @pending_use << "USE DATABASE #{self.class.quote_ident(database)}" unless database.empty?
-      @pending_use << "USE SCHEMA #{self.class.quote_ident(schema)}" if schema
+      @pending_use << "USE DATABASE #{self.class.use_ident(database)}" unless database.empty?
+      @pending_use << "USE SCHEMA #{self.class.use_ident(schema)}" if schema
       # Kept so they can be put back if the session is replaced under us.
       @session_defaults = @pending_use.dup.freeze
     end
@@ -213,9 +256,7 @@ module Frostlake
     # on whatever query happens to run first.
     def use_dsn_defaults
       check_open
-      @lock.synchronize do
-        round_trip(@pending_use.shift) until @pending_use.empty?
-      end
+      @lock.synchronize { apply_pending_use }
       nil
     end
 
@@ -236,31 +277,46 @@ module Frostlake
     # column name and whose row_count is the affected-row count for DML. A
     # multi-statement string answers with its first result set — use
     # execute_all for the rest.
-    def execute(sql, binds = [])
-      execute_all(sql, binds).first
+    def execute(sql, binds = [], multi_statement_count: nil)
+      execute_all(sql, binds, multi_statement_count: multi_statement_count).first
     end
 
     # Executes a statement string and returns every result set it produced, in
     # order. A single statement gives a one-element array.
-    def execute_all(sql, binds = [])
+    #
+    # multi_statement_count says how many statements this call carries, 0 for
+    # any number; the engine refuses a call whose count differs, as the account
+    # does. It rides on this one request and outranks the session's
+    # MULTI_STATEMENT_COUNT for it without changing any session state, so there
+    # is nothing to restore and a connection shared between threads is
+    # unaffected. Left out, nothing is sent and the session's value decides.
+    def execute_all(sql, binds = [], multi_statement_count: nil)
       check_open
+      unless multi_statement_count.nil? ||
+             (multi_statement_count.is_a?(Integer) && !multi_statement_count.negative?)
+        raise UsageError, "multi_statement_count must be a non-negative Integer, " \
+                          "got #{multi_statement_count.inspect}"
+      end
       rendered = binds.empty? ? sql : self.class.substitute(sql, binds)
       # The pending USE statements and the statement itself have to reach the
       # session as one unit: another thread must not slip a query in between,
       # and two threads must not both try to shift the same pending entry.
       @lock.synchronize do
-        restore_session_defaults
-        round_trip(@pending_use.shift) until @pending_use.empty?
-        results = shape_results(round_trip(rendered))
+        results = shape_results(perform(rendered, multi_statement_count))
         @session_touched = true if self.class.selects_session_state?(sql)
         results
       end
     end
 
+    # Opens a transaction: BEGIN, sent with autocommit off. The connection
+    # leaves autocommit only once the engine has opened the transaction, so a
+    # BEGIN that fails — refused, unreadable, never answered, lost with its
+    # session, or never sent because a USE queued ahead of it was refused —
+    # leaves every later statement committing as it runs.
     def begin_transaction
       @lock.synchronize do
+        perform("BEGIN", nil, false)
         @autocommit = false
-        execute("BEGIN")
       end
       nil
     end
@@ -297,9 +353,15 @@ module Frostlake
       raise
     end
 
+    # Closes the connection and releases its session on the engine with one
+    # DELETE /api/sessions/{id}, which also rolls back a transaction left open.
+    # The release is best effort, bounded by CLOSE_BUDGET, and never raises;
+    # an engine that predates it is sent nothing, and keeps the session until
+    # its own idle expiry. Closing again sends nothing.
     def close
       @closed = true
       @lock.synchronize do
+        release_session
         @http.finish if @http.started?
       rescue IOError
         # Already gone; closing is still closing.
@@ -314,14 +376,166 @@ module Frostlake
       raise UsageError, "connection is closed" if @closed
     end
 
-    # The engine reaps a session once it has been idle long enough and then
-    # quietly builds a fresh one for the id we keep sending, losing the database
-    # and schema we selected. Nothing in the reply gives it away — the id we
-    # sent is echoed back either way, and /api/sessions reports only a count —
-    # so past the limit the only safe reading is that the session is new, and
-    # the DSN's defaults go back on. Not once the caller has selected something
-    # themselves: putting our defaults over their choice is its own surprise.
+    # One statement on the session, under the lock: the pending USE statements
+    # first, with the connection's own autocommit, then the statement with
+    # auto_commit, and the session's state tracked from it. Answers the
+    # engine's answer.
+    def perform(sql, multi_statement_count, auto_commit = @autocommit)
+      # Again under the lock: a close that got in first has released the
+      # session, and a statement now would start one nobody releases.
+      check_open
+      restore_session_defaults
+      # Each pending USE is one statement of its own, whatever this call declares.
+      apply_pending_use
+      out = run(sql, multi_statement_count, auto_commit)
+      track_session(sql)
+      out
+    end
+
+    # Runs one statement on the session, or — when the engine no longer holds
+    # it — once more on a fresh one, if nothing the lost session held is lost
+    # with it. Sent again, it carries the autocommit it was first sent with.
+    def run(sql, multi_statement_count, auto_commit = @autocommit)
+      out = round_trip(sql, multi_statement_count, auto_commit)
+      return out unless out == SESSION_GONE
+
+      session_lost
+      apply_pending_use
+      out = round_trip(sql, multi_statement_count, auto_commit)
+      raise SessionLostError, "the engine refused a session it had just started" if out == SESSION_GONE
+
+      out
+    end
+
+    # Sends the pending USE statements, one request each. A session lost or
+    # replaced part-way takes the USEs already sent with it, so the whole of
+    # the DSN's scope goes onto the fresh one: once, since an engine that loses
+    # the session again within the same few requests is keeping none. And a
+    # scope that fails part-way stays pending in full, so no statement runs in
+    # a scope nobody chose.
+    def apply_pending_use
+      restarted = false
+      until @pending_use.empty?
+        queue = @pending_use.dup
+        answer = begin
+          round_trip(queue.first)
+        rescue Error
+          @pending_use.replace(@session_defaults.dup)
+          raise
+        end
+        if answer == SESSION_GONE
+          raise SessionLostError, "the engine refused a session it had just started" if restarted
+
+          restarted = true
+          session_lost
+        elsif @pending_use == queue || restarted
+          @pending_use.replace(queue.drop(1))
+        else
+          # absorb found the session replaced and queued the scope again.
+          restarted = true
+        end
+      end
+    end
+
+    # The engine no longer holds the session: it expired, was released, or the
+    # server restarted, and nothing ran. With a transaction or a moved context
+    # gone with it, re-running would put the statement somewhere its author
+    # did not intend, so that raises; either way the id is dropped and the
+    # DSN's scope queued, so the next statement starts a fresh session there.
+    def session_lost
+      had_transaction = @in_transaction
+      had_context = @dirty
+      forget_session
+      if had_transaction
+        raise SessionLostError,
+              "the engine no longer holds this connection's session (it expired, was released, " \
+              "or the server restarted), so its open transaction is gone; the statement did not run"
+      end
+      return unless had_context
+
+      raise SessionLostError,
+            "the engine no longer holds this connection's session (it expired, was released, " \
+            "or the server restarted), and the context set up on it (USE, SET, ALTER SESSION or " \
+            "a temporary object) went with it, so the statement was not re-run; the next " \
+            "statement starts a fresh session on the connection's scope"
+    end
+
+    # Starts over: no session, nothing held on one, and the DSN's scope queued
+    # for the next statement. A transaction lost with the session takes the
+    # driver's autocommit-off with it.
+    def forget_session
+      @autocommit = true if @in_transaction
+      @session_id = nil
+      @dirty = false
+      @in_transaction = false
+      @pending_use.replace(@session_defaults.dup)
+    end
+
+    # Keeps the connection's picture of its session in step with a statement
+    # that succeeded: whether it left context behind that a fresh session would
+    # not have, and whether a transaction is open.
+    def track_session(sql)
+      self.class.statements(sql).each do |statement|
+        @dirty = true if self.class.touches_session?(statement)
+        case self.class.transaction_effect(statement)
+        when :begins then @in_transaction = true
+        when :ends then @in_transaction = false
+        end
+      end
+    end
+
+    # Learns from an answer which session it ran in, and whether the engine
+    # tracks sessions: an answer naming one carries newSession, or comes from
+    # an engine older than the field, requireSession and DELETE /api/sessions.
+    def absorb(out, sent_id)
+      id = out["sessionId"]
+      return if id.nil?
+
+      if out.key?("newSession")
+        @tracks_sessions = true
+        # The engine ran the statement in a fresh session in place of ours, so
+        # whatever the old one held is gone, and the DSN's scope goes back on
+        # before the next statement.
+        forget_session if out["newSession"] == true && !sent_id.nil?
+      elsif @tracks_sessions.nil?
+        @tracks_sessions = false
+      end
+      @session_id = id
+    end
+
+    # One DELETE /api/sessions/{id}, bounded and never raising. Releasing the
+    # session also rolls back a transaction it left open.
+    def release_session
+      id = @session_id
+      @session_id = nil
+      @in_transaction = false
+      return if id.nil? || !@tracks_sessions
+
+      @http.open_timeout = [@http.open_timeout, CLOSE_BUDGET].min
+      @http.read_timeout = [@http.read_timeout, CLOSE_BUDGET].min
+      @http.write_timeout = [@http.write_timeout, CLOSE_BUDGET].min
+      # Net::HTTP re-sends an idempotent request once after a timeout, which
+      # would double the budget.
+      @http.max_retries = 0
+      path = "/api/sessions/#{URI.encode_www_form_component(id).gsub('+', '%20')}"
+      @http.request(Net::HTTP::Delete.new(path))
+      nil
+    rescue StandardError
+      # Best effort: the engine's idle expiry releases whatever this did not.
+      nil
+    end
+
+    # An engine that predates newSession reaps a session once it has been idle
+    # long enough and then quietly builds a fresh one for the id we keep
+    # sending, losing the database and schema we selected. Nothing in its reply
+    # gives it away — the id we sent is echoed back either way, and
+    # /api/sessions reports only a count — so past the limit the only safe
+    # reading is that the session is new, and the DSN's defaults go back on.
+    # Not once the caller has selected something themselves: putting our
+    # defaults over their choice is its own surprise. A later engine refuses a
+    # session it no longer holds, and run puts the scope back itself.
     def restore_session_defaults
+      return unless @tracks_sessions == false
       return if @session_defaults.empty? || @session_touched
       return if @session_idle_limit.zero? || @last_used_at.nil?
       return if self.class.monotonic_now - @last_used_at < @session_idle_limit
@@ -343,10 +557,24 @@ module Frostlake
       @http.ca_file = authority unless authority.nil?
     end
 
-    def round_trip(sql)
+    # One POST /api/execute: the parsed answer, or SESSION_GONE when the
+    # engine refused the session id as one it no longer holds. auto_commit is
+    # the request's autocommit: the connection's own unless a statement asks
+    # for another, as BEGIN does.
+    def round_trip(sql, multi_statement_count = nil, auto_commit = @autocommit)
       @lock.synchronize do
-        payload = { "sql" => sql, "autoCommit" => @autocommit }
-        payload["sessionId"] = @session_id if @session_id
+        sent_id = @session_id
+        # Resume this session or refuse, rather than have the engine start a
+        # fresh one under the same id where the statement would run without
+        # the context set up earlier. Only to an engine known to take the
+        # field: an older one might refuse a field it does not know.
+        required = !sent_id.nil? && @tracks_sessions == true
+        payload = { "sql" => sql, "autoCommit" => auto_commit }
+        payload["sessionId"] = sent_id if sent_id
+        payload["requireSession"] = true if required
+        # Absent unless this call asked for a count: a request without the field
+        # is the one the server has always been sent, and the session decides.
+        payload["multiStatementCount"] = multi_statement_count unless multi_statement_count.nil?
         request = Net::HTTP::Post.new("/api/execute", "content-type" => "application/json")
         request.body = JSON.generate(payload)
         response = begin
@@ -360,7 +588,12 @@ module Frostlake
         rescue JSON::ParserError
           raise ConnectionError, "HTTP #{response.code} with unreadable body"
         end
-        @session_id = out["sessionId"] if out["sessionId"]
+        # A 404 that names no session is the refusal requireSession asked for.
+        if required && response.code.to_s == "404" && !out["success"] && out["sessionId"].nil?
+          return SESSION_GONE
+        end
+
+        absorb(out, sent_id)
         raise QueryError, out["errorMessage"] || "statement failed" unless out["success"]
 
         @last_used_at = self.class.monotonic_now
@@ -381,7 +614,10 @@ module Frostlake
 
     def shape_result(result_set)
       columns = (result_set["columns"] || []).map do |c|
-        { name: c["name"], data_type: c["dataType"], scale: c["scale"] }
+        # length is a text column's width in characters and a binary column's in
+        # bytes. Every other type sends none, and so does a server that predates
+        # the field: it stays nil rather than becoming a width of 0.
+        { name: c["name"], data_type: c["dataType"], scale: c["scale"], length: c["length"] }
       end
       values = (result_set["rows"] || []).map do |raw|
         cells = []
@@ -410,6 +646,17 @@ module Frostlake
         "\"#{text.gsub('"', '""')}\""
       end
 
+      # A DSN's database or schema, rendered for USE. A plain name means what it
+      # means unquoted in SQL — the upper-case object it folds to — so it is
+      # folded before it is quoted; anything else is quoted exactly as given.
+      # Quoted as given, a lower-case name would ask for a lower-case object,
+      # which USE refuses: it resolves names exactly, as live does.
+      def use_ident(name)
+        text = name.to_s
+        text = text.upcase if text.match?(/\A[A-Za-z_][A-Za-z0-9_$]*\z/)
+        quote_ident(text)
+      end
+
       # Keeps every JSON number exact: the engine serializes fixed-point
       # numerics from BigDecimal, and Float would round the digits away before
       # convert ever sees them.
@@ -425,13 +672,27 @@ module Frostlake
         case (data_type || "").upcase
         when "DATE"
           value.is_a?(String) ? Date.parse(value) : value
-        when "TIMESTAMP", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ", "DATETIME"
+        when "TIMESTAMP", "TIMESTAMP_NTZ", "DATETIME"
+          value.is_a?(String) ? wall_clock(value) : value
+        when "TIMESTAMP_LTZ", "TIMESTAMP_TZ"
           value.is_a?(String) ? Time.parse(value) : value
         when "BINARY", "VARBINARY"
           value.is_a?(String) ? decode_hex(value) : value
         else
           convert_number(value, (data_type || "").upcase, scale)
         end
+      end
+
+      # A TIMESTAMP_NTZ is a wall clock with no zone, and its text carries none.
+      # Read in the process's local zone, a wall clock that zone skips would be
+      # moved — 01:30 on the night London springs forward would come back as
+      # 02:30 — and what a caller read would depend on the machine. UTC skips
+      # nothing, so the text is read there: every field comes back as written,
+      # on every host, and the instant is the one the engine's epoch arithmetic
+      # gives the value. Text with an offset of its own keeps it, since the
+      # parser takes the first zone it meets.
+      def wall_clock(text)
+        Time.parse("#{text} UTC")
       end
 
       # The engine renders binary as hex. Anything else is not ours to
@@ -509,6 +770,93 @@ module Frostlake
       # where they are, so the driver stops putting its defaults back.
       def selects_session_state?(sql)
         /(\A|[;\n])\s*USE\s/i.match?(sql)
+      end
+
+      # -- session tracking --------------------------------------------------
+
+      # The request split on its top-level semicolons, blank pieces dropped. A
+      # semicolon inside a literal, a quoted identifier, a $$ body or a comment
+      # does not split: the same constructs substitute steps over. A scripting
+      # block is split along with everything else, which only makes the checks
+      # below more willing to flag a request, the safe direction to be wrong in.
+      def statements(sql)
+        pieces = []
+        start = 0
+        i = 0
+        while i < sql.length
+          past = skip_non_code(sql, i)
+          if past
+            i = past
+          elsif sql[i] == ";"
+            pieces << sql[start...i]
+            start = i + 1
+            i += 1
+          else
+            i += 1
+          end
+        end
+        pieces << sql[start..]
+        pieces.reject { |piece| piece.strip.empty? }
+      end
+
+      # Up to limit leading words of a statement, upper-cased, skipping
+      # whitespace and comments and stopping at the first thing that is not a
+      # word.
+      def leading_words(statement, limit)
+        words = []
+        i = 0
+        while words.length < limit && i < statement.length
+          ch = statement[i]
+          nxt = statement[i + 1]
+          if ch.match?(/\s/)
+            i += 1
+          elsif (ch == "-" && nxt == "-") || (ch == "/" && nxt == "/")
+            i = skip_line(statement, i)
+          elsif ch == "/" && nxt == "*"
+            stop = statement.index("*/", i + 2)
+            i = stop.nil? ? statement.length : stop + 2
+          elsif ch.match?(WORD_CHAR)
+            start = i
+            i += 1 while i < statement.length && statement[i].match?(WORD_CHAR)
+            words << statement[start...i].upcase
+          else
+            break
+          end
+        end
+        words
+      end
+
+      # Whether a statement leaves behind state a fresh session would not have:
+      # a moved scope (USE, or CREATE or DROP of a DATABASE or SCHEMA), a
+      # session variable or setting (SET, UNSET, ALTER SESSION), or a temporary
+      # object. CREATE TABLE and its kind leave the session as it was.
+      def touches_session?(statement)
+        verb, *rest = leading_words(statement, 16)
+        case verb
+        when "USE", "SET", "UNSET"
+          true
+        when "ALTER"
+          rest.drop_while { |word| OBJECT_MODIFIERS.include?(word) }.first == "SESSION"
+        when "CREATE", "DROP"
+          modifiers = rest.take_while { |word| OBJECT_MODIFIERS.include?(word) }
+          return true if %w[DATABASE SCHEMA].include?(rest[modifiers.length])
+
+          verb == "CREATE" && modifiers.any? { |word| TEMPORARY.include?(word) }
+        else
+          false
+        end
+      end
+
+      # :begins, :ends or nil — what a statement does to the session's
+      # transaction. BEGIN on its own (or with TRANSACTION, WORK or NAME) opens
+      # one; BEGIN followed by a statement opens a scripting block instead.
+      def transaction_effect(statement)
+        words = leading_words(statement, 2)
+        return :ends if %w[COMMIT ROLLBACK].include?(words.first)
+        return :begins if words == ["START", "TRANSACTION"]
+        return nil unless words.first == "BEGIN"
+
+        words.length == 1 || %w[TRANSACTION WORK NAME].include?(words[1]) ? :begins : nil
       end
 
       # An explicit argument wins over the DSN, which wins over the default.
@@ -619,6 +967,25 @@ module Frostlake
       end
 
       private
+
+      # Index just past the literal, quoted identifier, $$ body or comment
+      # starting at i, or nil when i is code; the rules substitute follows.
+      def skip_non_code(sql, i)
+        ch = sql[i]
+        nxt = sql[i + 1]
+        if ch == "'"
+          skip_string(sql, i)
+        elsif ch == '"'
+          skip_quoted(sql, i)
+        elsif (ch == "-" && nxt == "-") || (ch == "/" && nxt == "/")
+          skip_line(sql, i)
+        elsif ch == "/" && nxt == "*"
+          stop = sql.index("*/", i + 2)
+          stop.nil? ? sql.length : stop + 2
+        elsif ch == "$" && nxt == "$"
+          skip_dollar_quoted(sql, i)
+        end
+      end
 
       def skip_string(sql, i)
         j = i + 1
