@@ -76,6 +76,33 @@ class SubstitutionTest < Minitest::Test
                  Frostlake::Connection.substitute("SELECT ? // keep ? here\n, ?", [1, 2])
   end
 
+  # As in the lexer, a line comment ends at a CR or an LF, whichever comes first.
+  def test_a_line_comment_ends_at_a_carriage_return
+    assert_equal "SELECT 1 -- c\r, 7", Frostlake::Connection.substitute("SELECT 1 -- c\r, ?", [7])
+    assert_equal "SELECT 1 // c\r, 7", Frostlake::Connection.substitute("SELECT 1 // c\r, ?", [7])
+  end
+
+  # The lexer reads a name whole, [a-zA-Z_][a-zA-Z0-9_$]*, so a$$b is one name.
+  def test_dollars_inside_a_name_open_no_body
+    assert_equal "SELECT 1 AS a$$b, 7", Frostlake::Connection.substitute("SELECT 1 AS a$$b, ?", [7])
+  end
+
+  # Bare, 3-? became 3--5, a line comment, and ?::VARCHAR cast before it negated.
+  def test_a_negative_number_binds_in_parentheses
+    assert_equal "SELECT 3-(-5)", Frostlake::Connection.substitute("SELECT 3-?", [-5])
+    assert_equal "SELECT (-5)::VARCHAR", Frostlake::Connection.substitute("SELECT ?::VARCHAR", [-5])
+    assert_equal "SELECT 3-5", Frostlake::Connection.substitute("SELECT 3-?", [5])
+  end
+
+  def test_every_kind_of_negative_number_is_parenthesised
+    assert_equal "(-2.5)", Frostlake::Connection.format_literal(-2.5)
+    assert_equal "(-123456789012345678901234567890)",
+                 Frostlake::Connection.format_literal(-123_456_789_012_345_678_901_234_567_890)
+    # The rendered text decides: -0.0 is not below zero, yet bare it would read 3--0.0.
+    assert_equal "(-0.0)", Frostlake::Connection.format_literal(-0.0)
+    assert_equal "[(-1), 2]", Frostlake::Connection.format_literal([-1, 2])
+  end
+
   def test_surplus_bind_values_are_ignored
     # Matching Frostlake's other drivers: too few raises, too many does not.
     assert_equal "SELECT 1", Frostlake::Connection.substitute("SELECT ?", [1, 2, 3])
@@ -93,6 +120,13 @@ class SubstitutionTest < Minitest::Test
 
     assert_equal "1.5", Frostlake::Connection.format_literal(BigDecimal("1.50"))
     assert_equal "0.1234567891", Frostlake::Connection.format_literal(BigDecimal("0.1234567891"))
+  end
+
+  def test_a_negative_bigdecimal_binds_in_parentheses
+    skip "bigdecimal is not available" unless defined?(BigDecimal)
+
+    assert_equal "(-2.5)", Frostlake::Connection.format_literal(BigDecimal("-2.5"))
+    assert_equal "(-0.0)", Frostlake::Connection.format_literal(BigDecimal("-0"))
   end
 
   def test_leaves_dollar_quoted_bodies_alone
@@ -462,6 +496,7 @@ class SessionIdleTest < Minitest::Test
     assert Frostlake::Connection.selects_session_state?("  use schema s")
     assert Frostlake::Connection.selects_session_state?("SELECT 1; USE WAREHOUSE W")
     assert Frostlake::Connection.selects_session_state?("-- first\nUSE DATABASE X")
+    assert Frostlake::Connection.selects_session_state?("-- first\rUSE DATABASE X")
     # A mention of USE inside a literal is not a USE.
     refute Frostlake::Connection.selects_session_state?("SELECT 'USE DATABASE X'")
   end
@@ -1061,6 +1096,14 @@ class SessionTrackingTest < Minitest::Test
   def test_leading_words_skip_comments_and_fold_case
     assert_equal ["CREATE", "OR", "REPLACE"],
                  Frostlake::Connection.leading_words("/* c */ -- x\n create or replace table t", 3)
+  end
+
+  def test_the_splitter_reads_names_and_line_ends_as_the_lexer_does
+    assert_equal ["SELECT 1 AS a$$b", " SELECT 2"],
+                 Frostlake::Connection.statements("SELECT 1 AS a$$b; SELECT 2")
+    assert_equal ["SELECT 1 -- c\r", " SELECT 2"],
+                 Frostlake::Connection.statements("SELECT 1 -- c\r; SELECT 2")
+    assert_equal ["USE", "DATABASE", "X"], Frostlake::Connection.leading_words("-- c\ruse database x", 3)
   end
 
   def test_which_statements_leave_session_state_behind

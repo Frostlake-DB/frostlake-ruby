@@ -32,7 +32,7 @@ rescue LoadError
 end
 
 module Frostlake
-  VERSION = "0.2.0"
+  VERSION = "0.2.1"
 
   # Every failure the driver raises is a Frostlake::Error, so one rescue still
   # catches the lot; the subclasses only say which kind it was.
@@ -86,6 +86,11 @@ module Frostlake
   # A$$B is a name.
   WORD_CHAR = /[[:alnum:]_$]/.freeze
 
+  # The first character of a name and the rest of one, as the engine's lexer
+  # reads an unquoted identifier: [a-zA-Z_][a-zA-Z0-9_$]*.
+  NAME_START = /[A-Za-z_]/.freeze
+  NAME_PART = /[A-Za-z0-9_$]/.freeze
+
   # The words that may sit between CREATE, DROP or ALTER and the kind of
   # object the statement names.
   OBJECT_MODIFIERS = ["OR", "REPLACE", "TRANSIENT", "TEMPORARY", "TEMP", "VOLATILE", "LOCAL", "GLOBAL",
@@ -95,7 +100,7 @@ module Frostlake
   # The modifiers that make an object temporary: it lives only as long as the
   # session that created it.
   TEMPORARY = ["TEMPORARY", "TEMP", "VOLATILE"].freeze
-  private_constant :WORD_CHAR, :OBJECT_MODIFIERS, :TEMPORARY
+  private_constant :WORD_CHAR, :NAME_START, :NAME_PART, :OBJECT_MODIFIERS, :TEMPORARY
 
   # Connects, verifies the server is reachable via GET /api/health, and applies
   # the database and schema from the DSN. Timeouts are in seconds; verify_ssl
@@ -769,7 +774,7 @@ module Frostlake
       # Once the caller has done that themselves, the DSN no longer describes
       # where they are, so the driver stops putting its defaults back.
       def selects_session_state?(sql)
-        /(\A|[;\n])\s*USE\s/i.match?(sql)
+        /(\A|[;\r\n])\s*USE\s/i.match?(sql)
       end
 
       # -- session tracking --------------------------------------------------
@@ -915,6 +920,12 @@ module Frostlake
             j = skip_line(sql, i)
             out << sql[i...j]
             i = j
+          elsif ch.match?(NAME_START)
+            # A name is read whole, as the lexer reads one: the $$ in a$$b opens
+            # no dollar-quoted body.
+            j = skip_name(sql, i)
+            out << sql[i...j]
+            i = j
           elsif ch == "$" && sql[i + 1] == "$"
             j = skip_dollar_quoted(sql, i)
             out << sql[i...j]
@@ -938,11 +949,11 @@ module Frostlake
         when nil then "NULL"
         when true then "TRUE"
         when false then "FALSE"
-        when Integer then value.to_s
+        when Integer then number_literal(value.to_s)
         when Float
           raise UsageError, "non-finite number #{value}" unless value.finite?
 
-          value.to_s
+          number_literal(value.to_s)
         # A Ruby Time always carries a UTC offset, so it maps to TIMESTAMP_TZ;
         # casting to NTZ here silently discarded that offset.
         when Time then "'#{value.strftime('%Y-%m-%dT%H:%M:%S.%6N%:z')}'::TIMESTAMP_TZ"
@@ -959,7 +970,7 @@ module Frostlake
         when Array then "[#{value.map { |element| format_literal(element) }.join(', ')}]"
         else
           if defined?(BigDecimal) && value.is_a?(BigDecimal)
-            value.to_s("F")
+            number_literal(value.to_s("F"))
           else
             raise UsageError, "unsupported bind type #{value.class}"
           end
@@ -973,7 +984,10 @@ module Frostlake
       def skip_non_code(sql, i)
         ch = sql[i]
         nxt = sql[i + 1]
-        if ch == "'"
+        if ch.match?(NAME_START)
+          # A name holds no separator, and the $$ inside one opens no body.
+          skip_name(sql, i)
+        elsif ch == "'"
           skip_string(sql, i)
         elsif ch == '"'
           skip_quoted(sql, i)
@@ -1024,9 +1038,28 @@ module Frostlake
         stop.nil? ? sql.length : stop + 2
       end
 
+      # Index just past the line end that closes the line comment starting at
+      # i. It ends at a line feed or a carriage return, whichever comes first,
+      # as the lexer's LINE_COMMENT does: ('--' | '//') ~[\r\n]*.
       def skip_line(sql, i)
-        j = sql.index("\n", i)
+        j = sql.index(/[\r\n]/, i)
         j.nil? ? sql.length : j + 1
+      end
+
+      # Index just past the name starting at i, read whole as the lexer reads
+      # one.
+      def skip_name(sql, i)
+        j = i + 1
+        j += 1 while j < sql.length && sql[j].match?(NAME_PART)
+        j
+      end
+
+      # A negative number goes in parentheses, which is one value wherever it
+      # lands: bare, 3-? would become 3--5, a line comment, and ?::VARCHAR would
+      # cast before it negates. The rendered text decides, so a float negative
+      # zero, written -0.0, is wrapped too.
+      def number_literal(text)
+        text.start_with?("-") ? "(#{text})" : text
       end
 
       def encode_string(text)
